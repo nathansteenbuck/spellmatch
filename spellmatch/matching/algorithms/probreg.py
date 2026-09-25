@@ -8,6 +8,7 @@ import pandas as pd
 import xarray as xr
 from probreg import bcpd, cpd, filterreg, gmmtree, l2dist_regs
 from probreg.transformation import Transformation
+from scipy.spatial import distance
 from sklearn.neighbors import NearestNeighbors
 
 from ..._spellmatch import hookimpl
@@ -19,6 +20,14 @@ except ImportError:
     cp = None
 
 logger = logging.getLogger(__name__)
+
+# probreg's CPD hardcodes 3D point clouds via the CoherentPointDrift._N_DIM class
+# attribute (default 3); its M-step (RigidCPD._maximization_step, a staticmethod)
+# reads this from the *class*, not the instance, so an instance-level override is
+# not enough. spellmatch's cell centroids are always 2D, and probreg.cpd is only
+# ever used here for that purpose in this process, so patch it globally at import
+# time rather than per-instance.
+cpd.CoherentPointDrift._N_DIM = 2
 
 
 @hookimpl
@@ -43,6 +52,34 @@ def spellmatch_get_mask_matching_algorithm(
     return list(algorithms.keys())
 
 
+def _cpd_correspondence_matrix(
+    t_source: np.ndarray, target: np.ndarray, sigma2: float, w: float
+) -> np.ndarray:
+    """Reproduce CPD's own E-step correspondence matrix at convergence.
+
+    Deliberately self-contained (only ``scipy``/``numpy``, no call into probreg's
+    private ``_compute_pmat_numerator``) so this stays correct across probreg
+    versions. Mirrors ``cpd.CoherentPointDrift.expectation_step`` with
+    ``use_color=False`` (spellmatch never sets ``use_color=True``): each column
+    (target point) sums to <=1, the shortfall being that point's probability of
+    being an outlier under CPD's own uniform-outlier component.
+    """
+    d2 = distance.cdist(t_source, target, "sqeuclidean")
+    pmat = np.exp(-d2 / (2.0 * sigma2))
+    n_source, n_target = t_source.shape[0], target.shape[0]
+    den = pmat.sum(axis=0)
+    if w > 0:
+        c = (
+            (2.0 * np.pi * sigma2) ** (t_source.shape[1] / 2.0)
+            * (w / (1.0 - w))
+            * n_source
+            / n_target
+        )
+        den = den + c
+    den[den == 0] = np.finfo(np.float64).eps
+    return pmat / den
+
+
 class _Probreg(PointsMatchingAlgorithm):
     def __init__(
         self,
@@ -61,6 +98,8 @@ class _Probreg(PointsMatchingAlgorithm):
         )
         self.max_dist = max_dist
         self._current_iteration: Optional[int] = None
+        self._current_correspondence: Optional[np.ndarray] = None
+        self._current_correspondence_sigma2: Optional[float] = None
 
     def _match_points(
         self,
@@ -78,17 +117,29 @@ class _Probreg(PointsMatchingAlgorithm):
         )
         info = {"iterations": self._current_iteration}
         self._current_iteration = None
-        source_ind = np.arange(len(source_points.index))
-        nn = NearestNeighbors(n_neighbors=1)
-        nn.fit(target_points.to_numpy())
-        nn_dists, nn_ind = nn.kneighbors(transform.transform(source_points.to_numpy()))
-        dists, target_ind = nn_dists[:, 0], nn_ind[:, 0]
-        if self.max_dist:
-            source_ind = source_ind[dists <= self.max_dist]
-            target_ind = target_ind[dists <= self.max_dist]
-            dists = dists[dists <= self.max_dist]
-        scores_data = np.zeros((len(source_points.index), len(target_points.index)))
-        scores_data[source_ind, target_ind] = 1
+        correspondence = self._current_correspondence
+        self._current_correspondence = None
+        if correspondence is not None:
+            scores_data = correspondence
+        else:
+            # Default fallback for algorithms that only produce a transform
+            # (BCPD, FilterReg, GMMReg/SVR, GMMTree): a hard nearest-neighbor
+            # match on the final registered points, thresholded by max_dist.
+            source_ind = np.arange(len(source_points.index))
+            nn = NearestNeighbors(n_neighbors=1)
+            nn.fit(target_points.to_numpy())
+            nn_dists, nn_ind = nn.kneighbors(
+                transform.transform(source_points.to_numpy())
+            )
+            dists, target_ind = nn_dists[:, 0], nn_ind[:, 0]
+            if self.max_dist:
+                source_ind = source_ind[dists <= self.max_dist]
+                target_ind = target_ind[dists <= self.max_dist]
+                dists = dists[dists <= self.max_dist]
+            scores_data = np.zeros(
+                (len(source_points.index), len(target_points.index))
+            )
+            scores_data[source_ind, target_ind] = 1
         scores = xr.DataArray(
             data=scores_data,
             coords={
@@ -141,6 +192,13 @@ class _CoherentPointDrift(_Probreg):
         result = instance.registration(
             target, w=self.w, maxiter=self.maxiter, tol=self.tol
         )
+        t_source = result.transformation.transform(source)
+        pmat = _cpd_correspondence_matrix(t_source, target, result.sigma2, self.w)
+        if self.max_dist is not None:
+            pmat = pmat.copy()
+            pmat[distance.cdist(t_source, target) > self.max_dist] = 0.0
+        self._current_correspondence = pmat
+        self._current_correspondence_sigma2 = result.sigma2
         return result.transformation
 
     @abstractmethod
