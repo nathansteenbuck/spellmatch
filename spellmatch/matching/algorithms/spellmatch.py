@@ -182,8 +182,19 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         # plan_spellmatch.md). adj1/adj2 are kept small and square; every use
         # of "adj_csr @ v" downstream is replaced by kron_matvec(adj1, adj2,
         # v, n1, n2), which is exact (verified) and never materializes it.
-        deg1 = np.sum(adj1, axis=1, dtype=np.uint8)
-        deg2 = np.sum(adj2, axis=1, dtype=np.uint8)
+        # dtype must have headroom for deg1[i]*deg2[j] below (numpy does not
+        # promote same-dtype arithmetic), not just for a single node's own
+        # degree -- uint8 silently wrapped this product whenever it exceeded
+        # 255 (e.g. two real degree-~17 nodes: 17*16=272 -> wrapped to 16),
+        # corrupting the D^-1/2 normalization for the affected candidate
+        # pairs and producing spurious non-convergence/NaN divergence in the
+        # opt_iteration loop. uint16 (max 65,535) gives a >3000x margin over
+        # any degree seen in practice at adj_radius~15 (geometrically, degree
+        # 256 on both sides would require ~2.8 px^2/cell, far denser than any
+        # real segmented cell) while costing far less than uint32/int64 at
+        # the (n1*n2)-scale of `deg` -- see plan_spellmatch.md.
+        deg1 = np.sum(adj1, axis=1, dtype=np.uint16)
+        deg2 = np.sum(adj2, axis=1, dtype=np.uint16)
         deg = np.asarray(deg1[:, np.newaxis] * deg2[np.newaxis, :])
         if "degree_cdist" not in c:
             c["degree_cdist"] = None
