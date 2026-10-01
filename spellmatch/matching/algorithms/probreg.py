@@ -140,11 +140,15 @@ class _Probreg(PointsMatchingAlgorithm):
                 (len(source_points.index), len(target_points.index))
             )
             scores_data[source_ind, target_ind] = 1
+        # Fixed dimension names, not source_name/target_name: see the
+        # matching comment in icp.py -- these collide into one dict key
+        # whenever source and target share an identifier (e.g. two panels
+        # of the same physical section).
         scores = xr.DataArray(
             data=scores_data,
             coords={
-                source_name: source_points.index.to_numpy(),
-                target_name: target_points.index.to_numpy(),
+                "source": source_points.index.to_numpy(),
+                "target": target_points.index.to_numpy(),
             },
         )
         return info, scores

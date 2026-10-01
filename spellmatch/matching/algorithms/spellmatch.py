@@ -367,11 +367,15 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                     scores_data = current_scores_data
                     cancor_mean = current_cancor_mean
             logger.info(f"Best lambda={lmd:.3g} (CC mean={cancor_mean:.6f})")
+        # Fixed dimension names, not source_adj.name/target_adj.name: see the
+        # matching comment in icp.py -- these collide into one dict key
+        # whenever source and target share an identifier (e.g. two panels
+        # of the same physical section).
         scores = xr.DataArray(
             data=scores_data,
             coords={
-                source_adj.name or "source": source_adj.coords["a"].to_numpy(),
-                target_adj.name or "target": target_adj.coords["x"].to_numpy(),
+                "source": source_adj.coords["a"].to_numpy(),
+                "target": target_adj.coords["x"].to_numpy(),
             },
         )
         return info, scores

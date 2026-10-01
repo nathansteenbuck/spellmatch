@@ -117,11 +117,16 @@ class IterativeClosestPoints(IterativePointsMatchingAlgorithm):
         self._current_dists_std = np.std(dists)
         scores_data = np.zeros((len(source_points.index), len(target_points.index)))
         scores_data[source_ind, target_ind] = 1
+        # Fixed dimension names, not source_name/target_name: those are the
+        # mask's own identifier (e.g. a filename stem) and collide into a
+        # single dict key -- silently dropping one whole dimension -- whenever
+        # source and target happen to share the same name/identifier (e.g.
+        # matching two panels of the same physical section, both named "A3").
         scores = xr.DataArray(
             data=scores_data,
             coords={
-                source_name: source_points.index.to_numpy(),
-                target_name: target_points.index.to_numpy(),
+                "source": source_points.index.to_numpy(),
+                "target": target_points.index.to_numpy(),
             },
         )
         return {}, scores
