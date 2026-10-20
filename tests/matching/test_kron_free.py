@@ -15,6 +15,7 @@ from scipy import sparse
 from spellmatch.matching._kron_free import (
     build_distance_correction,
     correction_matvec,
+    count_distance_correction,
     distance_term_matvec,
     estimate_correction_bytes,
     estimate_correction_nnz,
@@ -229,7 +230,124 @@ def test_estimate_correction_nnz_extrapolates_under_subsampling():
     assert rel_error < 0.25
 
 
-def test_estimate_correction_bytes_scales_linearly_with_nnz():
+def test_estimate_correction_bytes_counts_final_arrays_and_one_block():
     assert estimate_correction_bytes(0) == 0
-    assert estimate_correction_bytes(1000) == 40 * 1000
-    assert estimate_correction_bytes(2000) == 2 * estimate_correction_bytes(1000)
+    n = 1000
+    # int32: 4 B index + 8 B value per entry, int32 indptr, plus block buffer.
+    assert estimate_correction_bytes(500, n) == 500 * 12 + (n + 1) * 4 + 500 * 60
+    # Above the int32 limit everything switches to int64.
+    big = 2**31
+    assert estimate_correction_bytes(big, n, block_nnz=0) == big * 16 + (n + 1) * 8
+
+
+def _reference_build(d1, d2, thresh, n1, n2, chunk_size=2000):
+    """The previous build_distance_correction (lists of COO chunks,
+    concatenated, then converted), kept as ground truth for the rewrite."""
+    d1_coo = sparse.coo_array(d1)
+    upper = d1_coo.row < d1_coo.col
+    e1_a, e1_b = d1_coo.row[upper], d1_coo.col[upper]
+    e1_val = d1_coo.data[upper].astype(np.float64)
+    d2_coo = sparse.coo_array(d2)
+    e2_x, e2_y = d2_coo.row, d2_coo.col
+    e2_val = d2_coo.data.astype(np.float64)
+    thresh = np.float64(thresh)
+    rows, cols, vals = [], [], []
+    for start in range(0, len(e1_val), chunk_size):
+        stop = min(start + chunk_size, len(e1_val))
+        diff = e1_val[start:stop, np.newaxis] - e2_val[np.newaxis, :]
+        y = (diff / thresh) ** 2
+        ci, cj = np.nonzero(y > 1.0)
+        v = e1_a[start:stop][ci].astype(np.int64) * n2 + e2_x[cj]
+        w = e1_b[start:stop][ci].astype(np.int64) * n2 + e2_y[cj]
+        rows.append(np.minimum(v, w))
+        cols.append(np.maximum(v, w))
+        vals.append(y[ci, cj] - 1.0)
+    n = n1 * n2
+    if not rows:
+        return sparse.csr_array((n, n), dtype=np.float64)
+    return sparse.csr_array(
+        sparse.coo_array(
+            (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n, n),
+        )
+    )
+
+
+def _radius_graph(rng, n, side, radius):
+    """Distance-masked radius graph at real tissue density (degree ~7)."""
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(rng.uniform(0, side, (n, 2)))
+    d = sparse.csr_array(tree.sparse_distance_matrix(tree, radius))
+    d.eliminate_zeros()
+    return d
+
+
+def _assert_identical(actual, expected):
+    assert actual.nnz == expected.nnz
+    assert abs(actual - expected).max() == 0.0 if expected.nnz else actual.nnz == 0
+
+
+@pytest.mark.parametrize("thresh", [2.0, 5.0, 10.0])
+def test_build_matches_reference_bit_for_bit(thresh):
+    rng = np.random.default_rng(3)
+    n1, n2 = 300, 260
+    d1 = _radius_graph(rng, n1, 165.0, 15.0)
+    d2 = _radius_graph(rng, n2, 150.0, 15.0)
+    actual = build_distance_correction(d1, d2, thresh, n1, n2)
+    _assert_identical(actual, _reference_build(d1, d2, thresh, n1, n2))
+    assert actual.indices.dtype == actual.indptr.dtype == np.int32
+    assert count_distance_correction(d1, d2, thresh).sum() == actual.nnz
+
+
+def test_build_is_independent_of_block_size():
+    rng = np.random.default_rng(4)
+    n1, n2 = 200, 180
+    d1 = _radius_graph(rng, n1, 135.0, 15.0)
+    d2 = _radius_graph(rng, n2, 125.0, 15.0)
+    expected = _reference_build(d1, d2, 5.0, n1, n2)
+    for block_nnz in [1, 37, 10_000, 10**9]:
+        actual = build_distance_correction(d1, d2, 5.0, n1, n2, block_nnz=block_nnz)
+        _assert_identical(actual, expected)
+
+
+def test_build_handles_exact_boundary_ties():
+    # Edge lengths on a grid, so |d1 - d2| == thresh (y == 1, not clipped)
+    # occurs many times; the searchsorted bounds must land exactly on the
+    # predicate boundary.
+    rng = np.random.default_rng(5)
+    n1, n2 = 30, 35
+    a1 = _make_symmetric_adjacency(rng, n1, 0.3)
+    a2 = _make_symmetric_adjacency(rng, n2, 0.3)
+    lengths1 = np.triu(rng.integers(1, 13, (n1, n1)) * 0.5, 1)
+    lengths2 = np.triu(rng.integers(1, 13, (n2, n2)) * 0.5, 1)
+    d1 = sparse.csr_array(a1 * (lengths1 + lengths1.T))
+    d2 = sparse.csr_array(a2 * (lengths2 + lengths2.T))
+    for thresh in [0.5, 1.5, 2.5, 3.0]:
+        actual = build_distance_correction(d1, d2, thresh, n1, n2, block_nnz=50)
+        _assert_identical(actual, _reference_build(d1, d2, thresh, n1, n2))
+
+
+def test_build_is_empty_when_nothing_is_clipped(small_graphs):
+    rng, n1, n2, a1, a2, d1, d2 = small_graphs
+    thresh = 15.0  # every edge length is < 15 in small_graphs
+    correction = build_distance_correction(
+        sparse.csr_array(d1), sparse.csr_array(d2), thresh, n1, n2
+    )
+    assert correction.nnz == 0
+    s = rng.random(n1 * n2)
+    diff = sparse.kron(d1, a2).toarray() - sparse.kron(a1, d2).toarray()
+    expected = ((diff / thresh) ** 2) @ s
+    actual = distance_term_matvec(a1, a2, d1, d2, thresh, correction, s, n1, n2)
+    assert np.allclose(expected, actual, atol=1e-9)
+
+
+def test_build_falls_back_to_int64_indices(small_graphs, monkeypatch):
+    import spellmatch.matching._kron_free as kf
+
+    _, n1, n2, _, _, d1, d2 = small_graphs
+    d1, d2 = sparse.csr_array(d1), sparse.csr_array(d2)
+    monkeypatch.setattr(kf, "_INT32_LIMIT", 10)  # force the fallback
+    actual = kf.build_distance_correction(d1, d2, 3.0, n1, n2)
+    assert actual.indices.dtype == actual.indptr.dtype == np.int64
+    _assert_identical(actual, _reference_build(d1, d2, 3.0, n1, n2))

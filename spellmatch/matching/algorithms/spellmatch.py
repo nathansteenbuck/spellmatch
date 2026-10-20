@@ -17,9 +17,9 @@ from ..._spellmatch import hookimpl
 from .._kron_free import (
     CorrectionMatrixTooLargeError,
     build_distance_correction,
+    count_distance_correction,
     distance_term_matvec,
     estimate_correction_bytes,
-    estimate_correction_nnz,
     kron_matvec,
     outer_sum_matvec,
 )
@@ -672,35 +672,44 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         d1 = sparse.csr_array((adj1 * dists1).astype(np.float64))
         d2 = sparse.csr_array((adj2 * dists2).astype(np.float64))
 
+        # |d1 - d2| <= max edge length, so if no edge is longer than the
+        # threshold the clip can never fire and the correction is empty.
+        max_edge = max(
+            d1.max() if d1.nnz > 0 else 0.0, d2.max() if d2.nnz > 0 else 0.0
+        )
+        if max_edge <= self.distance_cdiff_thres:
+            logger.info(
+                "Distance-correction skipped: longest edge (%.3f) <= "
+                "distance_cdiff_thres (%s), nothing is clipped",
+                max_edge,
+                self.distance_cdiff_thres,
+            )
+            return d1, d2, sparse.csr_array((n1 * n2, n1 * n2), dtype=np.float64)
+
         if self.max_correction_gib is not None:
             budget_bytes = self.max_correction_gib * (1024**3)
-            estimated_nnz, rel_stderr = estimate_correction_nnz(
-                d1, d2, self.distance_cdiff_thres
+            nnz = int(
+                count_distance_correction(d1, d2, self.distance_cdiff_thres).sum()
             )
-            # Apply the sampling error as a one-sided safety margin so an
-            # under-estimate from sampling noise doesn't wave through a
-            # build that then exceeds the budget in practice.
-            estimated_bytes = estimate_correction_bytes(
-                int(estimated_nnz * (1.0 + 3.0 * rel_stderr))
-            )
+            estimated_bytes = estimate_correction_bytes(nnz, n1 * n2)
             if estimated_bytes > budget_bytes:
                 raise CorrectionMatrixTooLargeError(
-                    "Estimated distance-correction matrix "
-                    f"({estimated_nnz:,} nonzeros, ~{estimated_bytes / 1024**3:.1f} "
-                    f"GiB, {rel_stderr:.1%} sampling stderr) exceeds the configured "
-                    f"budget of {self.max_correction_gib:.1f} GiB (max_correction_gib). "
+                    "Distance-correction matrix "
+                    f"({nnz:,} nonzeros, ~{estimated_bytes / 1024**3:.1f} GiB to "
+                    f"build) exceeds the configured budget of "
+                    f"{self.max_correction_gib:.1f} GiB (max_correction_gib). "
                     "This FOV pair is too dense/large for the current distance-term "
                     "settings. Options: raise max_correction_gib if this host actually "
-                    "has the memory, reduce adj_radius/distance_cdiff_thres to shrink "
-                    "the candidate-edge space, or fall back to spatial tiling "
+                    "has the memory, set distance_cdiff_thres >= adj_radius (no "
+                    "correction needed), or fall back to spatial tiling "
                     "(plan_spellmatch.md, Stage 6 fallback options)."
                 )
             logger.info(
-                "Distance-correction pre-flight estimate: %s nonzeros "
-                "(~%.2f GiB, %.1f%% sampling stderr), within %.1f GiB budget",
-                f"{estimated_nnz:,}",
+                "Distance-correction pre-flight: %s nonzeros (exact), ~%.2f GiB "
+                "peak for building the correction matrix alone (not the whole "
+                "process), within %.1f GiB budget",
+                f"{nnz:,}",
                 estimated_bytes / 1024**3,
-                rel_stderr * 100,
                 self.max_correction_gib,
             )
 
