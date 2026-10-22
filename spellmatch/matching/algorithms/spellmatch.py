@@ -174,8 +174,10 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         # and runs out of memory for realistic FOV sizes. adj1/adj2 are kept
         # small and square; every "adj_csr @ v" is computed exactly by
         # kron_matvec(adj1, adj2, v, n1, n2) instead.
-        # dtype must have headroom for deg1[i]*deg2[j] below. uint8 previously led to non-convergence.
-        # now uint16 (max 65,535) gives a >3000x margin over any degree seen in practice at adj_radius~15.
+        # The degree dtype must have headroom for the product deg1[i]*deg2[j]
+        # below (numpy keeps the operands' dtype): with uint8, degrees above
+        # ~16 wrapped around and broke the D^-1/2 normalization. uint16 (max
+        # 65,535) leaves a wide margin at realistic adj_radius values.
         deg1 = np.sum(adj1, axis=1, dtype=np.uint16)
         deg2 = np.sum(adj2, axis=1, dtype=np.uint16)
         deg = np.asarray(deg1[:, np.newaxis] * deg2[np.newaxis, :])
@@ -489,7 +491,12 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         return info, s[:, 0].reshape((n1, n2))
 
     def _compute_degree_cdist(self, deg1: np.ndarray, deg2: np.ndarray) -> np.ndarray:
-        degree_cdiff = abs(deg1[:, np.newaxis] - deg2[np.newaxis, :])
+        # deg1/deg2 are unsigned: subtract in a signed dtype, otherwise a
+        # negative difference wraps around (e.g. 5 - 7 -> 65534) instead of
+        # giving |5 - 7| = 2.
+        degree_cdiff = np.abs(
+            deg1.astype(np.int32)[:, np.newaxis] - deg2.astype(np.int32)[np.newaxis, :]
+        )
         degree_cdist = (self.precision(degree_cdiff) / self.degree_cdiff_thres) ** 2
         np.clip(degree_cdist, 0, 1, out=degree_cdist)
         assert degree_cdist.dtype == self.precision

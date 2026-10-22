@@ -1354,14 +1354,14 @@ def cli_match(
     ):
         if len(source_mask_files) > 1:
             logger.info(f"MASK PAIR {i + 1}/{len(source_mask_files)}")
-        # Refuse to match a section against itself. Identical source/target
-        # names used to crash deep inside _match_graphs (coords={source_name:
-        # ..., target_name: ...} collapses to one dict key when the two
-        # names match -- fixed in commit e0099d8 by using fixed "source"/
-        # "target" dimension names instead), but identical source and target
-        # is still invalid input, not something to silently accommodate --
-        # checked here, before any file is read, following the same
-        # UsageError pattern glob_sorted already uses for mismatched counts.
+        # Refuse to match a section against itself. The matching algorithms
+        # use the source/target mask names as the dimension names of the
+        # scores (coords={source_name: ..., target_name: ...}), which
+        # collapses to a single key -- and crashes deep inside matching --
+        # when the two names are identical. Identical source and target is
+        # invalid input anyway, so it is rejected here, before any file is
+        # read, following the UsageError pattern glob_sorted already uses
+        # for mismatched counts.
         if source_mask_file.name == target_mask_file.name:
             raise click.UsageError(
                 f"source_mask and target_mask have the same filename "

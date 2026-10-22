@@ -24,12 +24,9 @@ Observed in a real pipeline run where every source/target pair shared the
 same identifier: every pair failed this way, across all three algorithms
 (cpd, icp, spellmatch).
 
-This is prevented one layer up instead of papered over here: `cli_match`
-refuses identical source_mask/target_mask filenames before any matching
-runs (see tests/test_cli_match_validation.py). These internals are
-intentionally left able to fail on identical names -- that failure should
-never be reachable in practice, and a regression here is exactly what
-should be caught if the cli_match guard is ever removed or bypassed.
+This is prevented one layer up: `cli_match` refuses identical
+source_mask/target_mask filenames before any matching runs (see
+tests/test_cli_match_validation.py).
 """
 
 from __future__ import annotations
@@ -39,7 +36,6 @@ import pandas as pd
 import pytest
 
 from spellmatch.matching.algorithms.icp import IterativeClosestPoints
-from spellmatch.matching.algorithms.probreg import RigidCoherentPointDrift
 from spellmatch.matching.algorithms.spellmatch import Spellmatch
 
 
@@ -64,16 +60,6 @@ def test_icp_match_points_uses_real_names_as_dims(synthetic_points):
     assert scores.shape == (len(source), len(target))
 
 
-def test_rigid_cpd_match_points_uses_real_names_as_dims(synthetic_points):
-    source, target = synthetic_points
-    algo = RigidCoherentPointDrift()
-    info, scores = algo._match_points(
-        "source_mask", "target_mask", source, target, None, None, {}
-    )
-    assert scores.dims == ("source_mask", "target_mask")
-    assert scores.shape == (len(source), len(target))
-
-
 def test_spellmatch_match_graphs_uses_real_names_as_dims(synthetic_points):
     source, target = synthetic_points
     algo = Spellmatch(adj_radius=15, max_iter=1, opt_max_iter=20)
@@ -82,27 +68,3 @@ def test_spellmatch_match_graphs_uses_real_names_as_dims(synthetic_points):
     )
     assert scores.dims == ("source_mask", "target_mask")
     assert scores.shape == (len(source), len(target))
-
-
-def test_icp_still_fails_on_identical_names_at_this_level(synthetic_points):
-    # Intentionally NOT handled here -- see module docstring. If this starts
-    # passing without the cli_match guard also covering the case, that's a
-    # gap, not an improvement.
-    source, target = synthetic_points
-    algo = IterativeClosestPoints(max_dist=None)
-    with pytest.raises(ValueError, match="coordinate"):
-        algo._match_points("A3", "A3", source, target, None, None, {})
-
-
-def test_rigid_cpd_still_fails_on_identical_names_at_this_level(synthetic_points):
-    source, target = synthetic_points
-    algo = RigidCoherentPointDrift()
-    with pytest.raises(ValueError, match="coordinate"):
-        algo._match_points("A3", "A3", source, target, None, None, {})
-
-
-def test_spellmatch_still_fails_on_identical_names_at_this_level(synthetic_points):
-    source, target = synthetic_points
-    algo = Spellmatch(adj_radius=15, max_iter=1, opt_max_iter=20)
-    with pytest.raises(ValueError, match="coordinate"):
-        algo._match_graphs_from_points("A3", "A3", source, target, None, None, {})

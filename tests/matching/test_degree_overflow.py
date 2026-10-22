@@ -1,85 +1,99 @@
-"""Regression test for the uint8 degree-product overflow bug.
+"""End-to-end check of Spellmatch's graph matching against the explicit formula.
 
-`Spellmatch._match_graphs` (spellmatch.py) computes per-node degree via
-`np.sum(adj, axis=1, dtype=X)`, then a full (n1, n2) outer product
-`deg1[:, None] * deg2[None, :]` -- computed in dtype X too, since numpy does
-not promote same-dtype arithmetic. With X=uint8 (the dtype used before this
-fix), individual degrees never overflow at realistic
-adj_radius values (max 20-30 seen on real IMC data), but their *product*
-routinely does: two real degree-17/16 nodes give 17*16=272, silently
-wrapping to 16 in uint8 arithmetic (mod 256), no warning, no error.
+`Spellmatch._match_graphs` never builds the (n1*n2)x(n1*n2) product-graph
+matrices; it computes ``w_csr @ s`` matrix-free (see ``_kron_free.py``). This
+test runs it on small graphs and compares the scores with a dense float64
+implementation of the explicit formulation
 
-This corrupts the D^-1/2 degree normalization for the affected candidate
-pairs (an artificially small "degree" gives an artificially large
-normalization weight), breaking the assumption that guarantees the
-assembled operator's spectral radius stays <=1 -- confirmed as the root
-cause of a real NaN-divergence failure on IMC data. Fixed by widening to
-uint16 (65,535 max),
-a >3000x margin over any degree observed in practice.
+    W = D^-1/2 (A - combined) D^-1/2,   s <- alpha * W s + (1 - alpha) * h
+
+with the degree and distance terms switched on.
+
+The graphs are dense enough that degree products exceed 255. This guards the
+uint8 degree-product overflow bug: degrees were summed as uint8, and
+``deg1[:, None] * deg2[None, :]`` stays uint8 (numpy does not promote
+same-dtype arithmetic), so e.g. 17*16=272 silently wrapped to 16. That
+corrupted the D^-1/2 normalization for the affected candidate pairs, broke
+the assumption that keeps the operator's spectral radius <= 1, and caused a
+real NaN-divergence failure on IMC data. Degrees are now uint16.
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pytest
+import pandas as pd
+
+from spellmatch.matching.algorithms.spellmatch import Spellmatch
+from spellmatch.utils import create_graph
 
 
-def _degree_product(adj1: np.ndarray, adj2: np.ndarray, dtype) -> np.ndarray:
-    """Mirrors spellmatch.py's exact degree + outer-product computation."""
-    deg1 = np.sum(adj1, axis=1, dtype=dtype)
-    deg2 = np.sum(adj2, axis=1, dtype=dtype)
-    return np.asarray(deg1[:, np.newaxis] * deg2[np.newaxis, :])
+def _points(rng, n, side):
+    return pd.DataFrame(
+        rng.uniform(0, side, (n, 2)),
+        columns=["x", "y"],
+        index=pd.Index(np.arange(1, n + 1), name="cell"),
+    )
 
 
-def test_uint8_silently_wrapped_this_exact_real_case():
-    # Real values from the diverging FOV pair (p28_r32_a32 <-> p18_r43_a43):
-    # a source node with 17 neighbors, a target node with 16.
-    adj1 = np.zeros((18, 18), dtype=bool)
-    adj1[0, 1:18] = True  # node 0 has degree 17
-    adj2 = np.zeros((17, 17), dtype=bool)
-    adj2[0, 1:17] = True  # node 0 has degree 16
-
-    prod_uint8 = _degree_product(adj1, adj2, np.uint8)
-    assert prod_uint8.dtype == np.uint8
-    assert prod_uint8[0, 0] == 16  # 272 mod 256 -- the historical bug
-
-    prod_uint16 = _degree_product(adj1, adj2, np.uint16)
-    assert prod_uint16.dtype == np.uint16
-    assert prod_uint16[0, 0] == 272  # true value, no wraparound
-
-
-def test_uint16_has_large_margin_over_realistic_degrees():
-    # Max degree observed on real data at adj_radius=15 was 20; stress-test
-    # with degrees an order of magnitude higher on both sides (200*200 =
-    # 40,000 < 65,535) to confirm headroom, not just the one real example.
-    adj1 = np.zeros((201, 201), dtype=bool)
-    adj1[0, 1:201] = True  # degree 200
-    adj2 = np.zeros((201, 201), dtype=bool)
-    adj2[0, 1:201] = True  # degree 200
-
-    prod = _degree_product(adj1, adj2, np.uint16)
-    assert prod[0, 0] == 200 * 200 == 40000
-
-
-def test_uint16_still_overflows_far_beyond_any_realistic_degree():
-    # Documents where uint16's own limit sits, for completeness -- this
-    # regime (degree ~256+ simultaneously on both graphs) would require
-    # ~2.8 px^2/cell at adj_radius=15, far denser than any real segmented
-    # cell, so this is not expected to occur in practice.
-    adj1 = np.zeros((257, 257), dtype=bool)
-    adj1[0, 1:257] = True  # degree 256
-    adj2 = np.zeros((257, 257), dtype=bool)
-    adj2[0, 1:257] = True  # degree 256
-
-    prod = _degree_product(adj1, adj2, np.uint16)
-    assert prod[0, 0] == 0  # 65536 mod 65536 -- confirms the boundary exists
+def _reference_scores(adj1, adj2, dists1, dists2, algo):
+    """Dense float64 implementation of the explicit Spellmatch iteration."""
+    a1 = adj1.astype(np.float64)
+    a2 = adj2.astype(np.float64)
+    n = len(a1) * len(a2)
+    adj = np.kron(a1, a2)
+    deg1, deg2 = a1.sum(axis=1), a2.sum(axis=1)
+    deg = np.kron(deg1, deg2)
+    d = np.zeros(n)
+    d[deg > 0] = deg[deg > 0] ** -0.5
+    u = np.clip(
+        (np.abs(deg1[:, None] - deg2[None, :]) / algo.degree_cdiff_thres) ** 2, 0, 1
+    ).ravel()
+    length_diff = np.kron(a1 * dists1, a2) - np.kron(a1, a2 * dists2)
+    y = np.clip((length_diff / algo.distance_cdiff_thres) ** 2, 0, 1)
+    combined = adj * (
+        algo.degree_weight * (u[:, None] + u[None, :]) + algo.distance_weight * y
+    )
+    combined /= 2 * algo.degree_weight + algo.distance_weight
+    w = d[:, None] * (adj - combined) * d[None, :]
+    h = np.full(n, 1.0 / n)
+    s = h.copy()
+    for _ in range(algo.opt_max_iter):
+        s_new = algo.alpha * (w @ s) + (1 - algo.alpha) * h
+        converged = np.linalg.norm(s - s_new) < algo.opt_tol
+        s = s_new
+        if converged:
+            break
+    return s.reshape(len(a1), len(a2))
 
 
-def test_spellmatch_match_graphs_uses_uint16_not_uint8():
-    import inspect
+def test_match_graphs_matches_explicit_formula_with_large_degrees():
+    rng = np.random.default_rng(0)
+    # ~30 cells in a 25x25 px square with adj_radius=15: most cells have
+    # 15-25 neighbors, so degree products exceed 255.
+    source_adj, source_dists = create_graph(
+        "source", _points(rng, 30, 25.0), 15.0, "a", "b"
+    )
+    target_adj, target_dists = create_graph(
+        "target", _points(rng, 28, 25.0), 15.0, "x", "y"
+    )
+    adj1, adj2 = source_adj.to_numpy(), target_adj.to_numpy()
+    assert adj1.sum(axis=1).max() * adj2.sum(axis=1).max() > 255
 
-    from spellmatch.matching.algorithms.spellmatch import Spellmatch
+    algo = Spellmatch(
+        adj_radius=15.0,
+        degree_weight=1.0,
+        distance_weight=1.0,
+        distance_cdiff_thres=5.0,
+        precision="float64",
+        opt_max_iter=500,
+        opt_tol=1e-12,
+    )
+    _, scores = algo._match_graphs(
+        source_adj, target_adj, source_dists, target_dists, None, None, {}
+    )
 
-    src = inspect.getsource(Spellmatch._match_graphs)
-    assert "np.uint16" in src
-    assert "np.uint8" not in src
+    expected = _reference_scores(
+        adj1, adj2, source_dists.to_numpy(), target_dists.to_numpy(), algo
+    )
+    assert np.all(np.isfinite(scores.to_numpy()))
+    np.testing.assert_allclose(scores.to_numpy(), expected, rtol=1e-8, atol=0)

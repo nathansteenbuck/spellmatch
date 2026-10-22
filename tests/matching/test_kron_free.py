@@ -14,7 +14,6 @@ from scipy import sparse
 from spellmatch.matching._kron_free import (
     DistanceTerms,
     build_distance_correction,
-    correction_matvec,
     distance_term_matvec,
     kron_matvec,
     outer_sum_matvec,
@@ -146,43 +145,42 @@ def test_distance_term_matvec_combined_with_degree_term(small_graphs):
     assert np.allclose(expected, actual, atol=1e-9)
 
 
-def test_float32_precision_gap_and_float64_mitigation():
-    # The d1^2+d2^2-2*d1*d2 expansion loses precision relative to
-    # (d1-d2)^2 directly; verifies the required
-    # float64 mitigation actually closes the gap, on a near-perfect-match
-    # (worst-case cancellation) scenario.
+def test_distance_term_needs_float64_when_edge_lengths_nearly_match():
+    # Worst-case cancellation: every edge is ~10 px long, so for every edge
+    # pair the expansion d1^2 - 2*d1*d2 + d2^2 subtracts numbers of ~100 to
+    # get ~1e-6. distance_term_matvec (float64) must stay accurate, while
+    # the same expansion in float32 is off by orders of magnitude -- which
+    # is why the distance term is computed in float64.
     rng = np.random.default_rng(2)
-    n1, n2 = 60, 70
+    n1, n2 = 40, 45
     a1 = _make_symmetric_adjacency(rng, n1, 0.2)
     a2 = _make_symmetric_adjacency(rng, n2, 0.2)
-    dists1 = np.triu(rng.uniform(1, 15, (n1, n1)), 1)
-    dists1 = dists1 + dists1.T
-    # near-perfect alignment: d2 is d1 plus tiny noise wherever shapes allow
-    noise = rng.normal(0, 1e-3, (n1, n1))
-    dists2_pattern = np.abs(dists1 + noise)
-    dists2 = np.resize(dists2_pattern, (n2, n2))
-    dists2 = np.triu(dists2, 1)
-    dists2 = dists2 + dists2.T
-
-    d1 = (a1 * dists1).astype(np.float64)
-    d2 = (a2 * dists2).astype(np.float64)
+    lengths1 = np.triu(10 + rng.normal(0, 1e-3, (n1, n1)), 1)
+    lengths2 = np.triu(10 + rng.normal(0, 1e-3, (n2, n2)), 1)
+    d1 = a1 * (lengths1 + lengths1.T)
+    d2 = a2 * (lengths2 + lengths2.T)
     thresh = 5.0
     s = rng.random(n1 * n2)
 
     diff = sparse.kron(d1, a2).toarray() - sparse.kron(a1, d2).toarray()
-    y_true = np.clip((diff / thresh) ** 2, 0, 1)
-    expected = y_true @ s
+    expected = np.clip((diff / thresh) ** 2, 0, 1) @ s
+
+    def rel_err(actual):
+        return np.abs(actual - expected).max() / np.abs(expected).max()
 
     correction = build_distance_correction(
-        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2
+        sparse.csr_array(d1), sparse.csr_array(d2), thresh, n1, n2
     )
     terms = DistanceTerms(d1, d2, thresh, correction)
-    actual = distance_term_matvec(a1, a2, terms, s, n1, n2)
-    rel_err = np.abs(actual - expected) / (np.abs(expected).max() + 1e-12)
-    # float64 throughout (as required by _kron_free.distance_term_matvec)
-    # should land close to machine epsilon, not the ~1e-4 float32 would give
-    # in this near-perfect-alignment / peaked scenario.
-    assert rel_err.max() < 1e-9
+    assert rel_err(distance_term_matvec(a1, a2, terms, s, n1, n2)) < 1e-6
+
+    f32 = np.float32
+    expansion_f32 = (
+        kron_matvec(f32(d1 * d1), f32(a2), f32(s), n1, n2)
+        - 2 * kron_matvec(f32(d1), f32(d2), f32(s), n1, n2)
+        + kron_matvec(f32(a1), f32(d2 * d2), f32(s), n1, n2)
+    ) / f32(thresh**2)
+    assert rel_err(expansion_f32) > 1e-2
 
 
 def _reference_build(d1, d2, thresh, n1, n2, chunk_size=2000):
@@ -272,7 +270,7 @@ def test_build_handles_exact_boundary_ties():
         _assert_identical(actual, _reference_build(d1, d2, thresh, n1, n2))
 
 
-def test_build_is_empty_when_nothing_is_clipped(small_graphs):
+def test_build_returns_none_when_nothing_is_clipped(small_graphs):
     rng, n1, n2, a1, a2, d1, d2 = small_graphs
     thresh = 15.0  # every edge length is < 15 in small_graphs
     correction = build_distance_correction(

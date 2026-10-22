@@ -7,11 +7,17 @@ rewritten as a sequence of ordinary ``n1 x n1`` / ``n2 x n2`` operations
 instead of ever materializing ``A1 (x) A2``. Each identity used here is
 checked against a dense ground truth in ``tests/matching/test_kron_free.py``.
 
-Precision note: ``A1, A2, D1, D2`` and the internal distance-term algebra are
-required to be float64 -- these matrices are always small regardless of
-dtype, and the distance term's expansion ``d1^2 - 2*d1*d2 + d2^2`` suffers
-measurable catastrophic cancellation in float32. The public functions below therefore work in
-float64 internally and cast to the caller's target dtype only on return.
+Notation: ``a1``/``a2`` are the source/target adjacency matrices, ``d1``/``d2``
+the same graphs with edge lengths as entries (``d1 = a1 ⊙ dists1``), and
+``A = a1 kron a2`` the product graph over candidate pairs ``v = a*n2 + x``
+(source cell ``a``, target cell ``x``).
+
+Precision note: the distance term's expansion ``d1^2 - 2*d1*d2 + d2^2``
+suffers measurable catastrophic cancellation in float32, so
+``distance_term_matvec`` always computes in float64. ``kron_matvec`` and
+``outer_sum_matvec`` compute in the dtype of their inputs; the caller
+(``Spellmatch._match_graphs_for_lambda``) passes float64 and casts the result
+to its target precision.
 """
 
 from __future__ import annotations
@@ -31,8 +37,9 @@ def kron_matvec(
 ) -> np.ndarray:
     """Compute ``(x kron y) @ v`` without forming ``x kron y``.
 
-    ``x`` is ``(n1, n1)``, ``y`` is ``(n2, n2)``, ``v`` has length ``n1*n2``
-    and is interpreted with the row-major convention ``v[a*n2+x] = V[a, x]``.
+    ``x`` is ``(n1, n1)``, ``y`` is ``(n2, n2)`` (dense or sparse), and ``v``
+    has length ``n1*n2``. ``V`` is ``v`` reshaped row-major to ``(n1, n2)``,
+    i.e. ``v[i*n2 + j] = V[i, j]``.
 
     Identity: ``(x kron y) @ v == vec(x @ V @ y.T)``.
     """
@@ -94,17 +101,19 @@ def _clipped(d1_val: np.ndarray, d2_val: np.ndarray, thresh: np.float64) -> np.n
 def _correction_layout(d1: sparse.spmatrix, d2: sparse.spmatrix, thresh: float):
     """Setup for building the correction matrix.
 
-    Returns the upper-triangle D1 edges sorted by source cell ``a``, the D2
-    edges sorted by length, and per D1 edge the bounds ``lo``/``hi`` such that
-    its clipped D2 partners are exactly sorted positions ``[0, lo)`` and
-    ``[hi, E2)``.
+    Returns the source edges (``d1``, upper triangle ``a < b`` only) sorted by
+    source cell ``a``, all directed target edges (``d2``, both directions)
+    sorted by length, and per source edge the bounds ``lo``/``hi`` such that
+    its clipped target edges are exactly the sorted positions ``[0, lo)`` and
+    ``[hi, E2)``, where ``E2`` is the number of directed target edges.
 
-    The predicate ``((d - e)/thresh)**2 > 1`` is monotone in the sorted D2
-    length ``e`` on either side of ``d`` (every floating-point step is
-    monotone), so the clipped partners always form a prefix and a suffix of
-    the sorted order. ``searchsorted`` finds the bounds up to rounding; the
-    bounds are then moved one position at a time until the exact predicate
-    holds on the inside and fails on the outside.
+    For a source edge of length ``d``, the predicate ``((d - e)/thresh)**2 > 1``
+    is monotone in the sorted target edge length ``e`` on either side of ``d``
+    (every floating-point step is monotone), so the clipped target edges
+    always form a prefix and a suffix of the sorted order. ``searchsorted``
+    finds the bounds up to rounding; the bounds are then moved one position
+    at a time until the exact predicate holds on the inside and fails on the
+    outside.
     """
     thresh = np.float64(thresh)
 
@@ -173,18 +182,21 @@ def build_distance_correction(
     """Build the sparse correction matrix ``relu(y-1)`` for the distance term,
     or return ``None`` if no edge pair is clipped (no correction needed).
 
-    ``d1 = A1 ⊙ dists1``, ``d2 = A2 ⊙ dists2`` (edge-masked distances, i.e.
-    zero everywhere the corresponding adjacency is zero). Only entries where
-    the clip actually fires (``y = ((d1[a,b]-d2[x,y])/thresh)**2 > 1``) are
-    stored, and only the upper triangle (``v < w``):
-    the whole formulation is exactly symmetric with a structurally zero
-    diagonal, so this loses no information and the matvec later reconstructs
-    the full effect via ``U@s + U.T@s``.
+    ``d1 = a1 ⊙ dists1``, ``d2 = a2 ⊙ dists2`` (edge-masked distances, i.e.
+    zero everywhere the corresponding adjacency is zero). For a source edge
+    ``(a, b)`` and a target edge ``(x, x')``, the entry at row
+    ``v = a*n2 + x`` and column ``w = b*n2 + x'`` is ``y - 1`` with
+    ``y = ((d1[a, b] - d2[x, x'])/thresh)**2``. Only entries where the clip
+    actually fires (``y > 1``) are stored, and only the upper triangle
+    (``v < w``): the full matrix is exactly symmetric with a structurally zero
+    diagonal, so this loses no information and ``correction_matvec``
+    reconstructs the full effect via ``U@s + U.T@s``.
 
-    Iterating the *undirected* edges of G1 once each (``a < b``) against *all*
-    directed edges of G2 visits every unordered candidate pair exactly once.
-    Since ``a < b``, ``v = a*n2 + x < b*n2 <= w``, so every entry already lies
-    in the upper triangle.
+    Iterating the *undirected* source edges once each (``a < b``) against
+    *all directed* target edges visits every unordered pair ``{v, w}`` of
+    product-graph nodes exactly once. Since ``a < b``,
+    ``v = a*n2 + x < b*n2 <= w``, so every entry already lies in the upper
+    triangle.
 
     Memory: the exact nnz is counted first (from ``_correction_layout``'s
     ``lo``/``hi``, without any edge-pair-scale allocation) and the CSR arrays
@@ -256,7 +268,9 @@ def build_distance_correction(
         cols = e1_b[edge].astype(np.int64) * n2 + e2_y[j]
         del edge, j
 
-        block = sparse.coo_array((vals, (rows, cols)), shape=((a1 - a0) * n2, n)).tocsr()
+        block = sparse.coo_array(
+            (vals, (rows, cols)), shape=((a1 - a0) * n2, n)
+        ).tocsr()
         del vals, rows, cols
 
         # Rows of cells without upper edges (between blocks) are empty.
@@ -280,6 +294,13 @@ def correction_matvec(correction: sparse.csr_array, s: np.ndarray) -> np.ndarray
     matrix's action is ``U@s + U.T@s``.
     """
     return correction @ s + correction.T @ s
+
+
+def _as_float64(m):
+    """``m`` as float64, keeping it sparse if it is sparse."""
+    if sparse.issparse(m):
+        return m.astype(np.float64)
+    return np.asarray(m, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -307,19 +328,19 @@ def distance_term_matvec(
     n1: int,
     n2: int,
 ) -> np.ndarray:
-    """Compute ``Wdistance @ s`` (i.e. ``clip(y,0,1) @ s``) without ever
-    materializing an edge-pair-scale dense/kron object.
+    """Compute the distance term ``(A ⊙ clip(y, 0, 1)) @ s`` without
+    materializing any ``(n1*n2) x (n1*n2)`` object, where ``y`` is the squared
+    scaled edge-length difference defined in ``build_distance_correction``.
 
-    ``y@s`` is computed via the exact three-term Kronecker decomposition of
-    the squared difference, in float64 (required, see the module docstring);
-    the clip is applied via ``y - relu(y-1)``, with
-    ``relu(y-1)`` supplied pre-built as ``terms.correction``.
+    The unclipped ``(A ⊙ y) @ s`` is computed exactly via the three-term
+    Kronecker expansion ``(d1² kron a2 - 2 d1 kron d2 + a1 kron d2²) @ s /
+    thresh²``, in float64 (required, see the module docstring). The clip is
+    applied as ``y - relu(y-1)``, with ``relu(y-1)`` supplied pre-built as
+    ``terms.correction`` (``None``: nothing is clipped).
     """
     d1, d2, thresh = terms.d1, terms.d2, terms.thresh
-    d1_f64 = d1.astype(np.float64) if sparse.issparse(d1) else np.asarray(d1, dtype=np.float64)
-    d2_f64 = d2.astype(np.float64) if sparse.issparse(d2) else np.asarray(d2, dtype=np.float64)
-    a1_f64 = a1.astype(np.float64) if sparse.issparse(a1) else np.asarray(a1, dtype=np.float64)
-    a2_f64 = a2.astype(np.float64) if sparse.issparse(a2) else np.asarray(a2, dtype=np.float64)
+    d1_f64, d2_f64 = _as_float64(d1), _as_float64(d2)
+    a1_f64, a2_f64 = _as_float64(a1), _as_float64(a2)
     s_f64 = np.asarray(s, dtype=np.float64)
 
     d1_sq = d1_f64.multiply(d1_f64) if sparse.issparse(d1_f64) else d1_f64 * d1_f64
