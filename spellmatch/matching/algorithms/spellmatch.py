@@ -169,13 +169,11 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         n2 = len(target_adj)
         adj1 = source_adj.to_numpy().astype(np.bool_)
         adj2 = target_adj.to_numpy().astype(np.bool_)
-        # NOTE (matrix-free fork): the original computed
-        #   adj_csr = sparse.kron(adj1, adj2)
-        # here -- an (n1*n2)x(n1*n2) matrix with nnz(adj1)*nnz(adj2) entries,
-        # the root cause of the OOM failures this fork addresses.
-        # adj1/adj2 are kept small and square; every use
-        # of "adj_csr @ v" downstream is replaced by kron_matvec(adj1, adj2,
-        # v, n1, n2), which is exact (verified) and never materializes the product graph.
+        # The product graph adj_csr = sparse.kron(adj1, adj2) is never built:
+        # it is an (n1*n2)x(n1*n2) matrix with nnz(adj1)*nnz(adj2) entries
+        # and runs out of memory for realistic FOV sizes. adj1/adj2 are kept
+        # small and square; every "adj_csr @ v" is computed exactly by
+        # kron_matvec(adj1, adj2, v, n1, n2) instead.
         # dtype must have headroom for deg1[i]*deg2[j] below. uint8 previously led to non-convergence.
         # now uint16 (max 65,535) gives a >3000x margin over any degree seen in practice at adj_radius~15.
         deg1 = np.sum(adj1, axis=1, dtype=np.uint16)
@@ -382,15 +380,14 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         else:
             intensity_cdist = None
         logger.info("Initializing")
-        # NOTE (matrix-free fork): the original built an explicit
-        #   w_csr = d_dia @ (adj_csr - combined) @ d_dia
-        # sparse matrix here, of the same (n1*n2)x(n1*n2) scale as adj_csr,
-        # and reused it as an actual matrix for every opt_iteration below.
-        # Instead we build only the small ingredients each term needs, and
-        # define w_matvec(v) = ~W @ v, computed fresh (cheaply) each call.
-        # This is an exact reformulation, not an approximation of w_csr@v.
-        # The distance term's algebra has a affected precision difference,
-        # which is why it is forced to float64 below regardless of self.precision.
+        # The iteration needs w_csr @ v with
+        #   w_csr = d_dia @ (adj_csr - combined) @ d_dia,
+        # an (n1*n2)x(n1*n2) matrix like adj_csr. Instead of building it, we
+        # build only the small ingredients each term needs and define
+        # w_matvec(v) = w_csr @ v, computed fresh each call. This is an exact
+        # reformulation, not an approximation. The distance term's expansion
+        # is sensitive to cancellation, which is why it is computed in float64
+        # regardless of self.precision.
         total_weight = 0.0
         if self.degree_weight > 0:
             total_weight += 2 * self.degree_weight
@@ -612,12 +609,13 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         n1: int,
         n2: int,
     ) -> DistanceTerms:
-        """Matrix-free replacement for the original ``_compute_distance_cdist``.
+        """Ingredients for the distance cross-distance, in matrix-free form.
 
-        The original built ``clip(((kron(adj1*dists1,adj2) -
-        kron(adj1,adj2*dists2))/thresh)**2, 0, 1)`` directly, an
-        ``(n1*n2)x(n1*n2)`` matrix with ``nnz(adj1)*nnz(adj2)`` entries -- the
-        root cause of the OOM failures this fork fixes.
+        The distance cross-distance is ``clip(((kron(adj1*dists1,adj2) -
+        kron(adj1,adj2*dists2))/thresh)**2, 0, 1)``, an ``(n1*n2)x(n1*n2)``
+        matrix with ``nnz(adj1)*nnz(adj2)`` entries that runs out of memory
+        for realistic FOV sizes if built explicitly (as the previous
+        ``_compute_distance_cdist`` did).
 
         Returns ``DistanceTerms(d1, d2, thresh, correction)``: ``d1 = adj1 ⊙
         dists1``, ``d2 = adj2 ⊙ dists2`` are small (``n1xn1``/``n2xn2``)

@@ -141,9 +141,8 @@ class _Probreg(PointsMatchingAlgorithm):
             )
             scores_data[source_ind, target_ind] = 1
         # source_name/target_name used as dimension names -- see the
-        # matching comment in icp.py. Identical-name collision is now
-        # prevented upstream (cli_match / validate_registration_rows), not
-        # handled here.
+        # matching comment in icp.py. Identical-name collision is prevented
+        # earlier (cli_match), not handled here.
         scores = xr.DataArray(
             data=scores_data,
             coords={

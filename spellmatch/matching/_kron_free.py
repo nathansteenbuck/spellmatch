@@ -1,17 +1,16 @@
 """Matrix-free replacements for the Kronecker-product-scale computations in
 :class:`spellmatch.matching.algorithms.spellmatch.Spellmatch`.
 
-See ``plan_spellmatch.md`` (matchingwizard) for the full derivation and the
-numerical investigation behind every choice made here. In one line: the
-fixed-point iteration only ever needs ``W @ s`` for a changing vector ``s``,
-never the ``(n1*n2) x (n1*n2)`` matrix ``W`` itself, so every term is
+The fixed-point iteration only ever needs ``W @ s`` for a changing vector
+``s``, never the ``(n1*n2) x (n1*n2)`` matrix ``W`` itself, so every term is
 rewritten as a sequence of ordinary ``n1 x n1`` / ``n2 x n2`` operations
-instead of ever materializing ``A1 (x) A2``.
+instead of ever materializing ``A1 (x) A2``. Each identity used here is
+checked against a dense ground truth in ``tests/matching/test_kron_free.py``.
 
 Precision note: ``A1, A2, D1, D2`` and the internal distance-term algebra are
-required to be float64 (see plan §Step 4b) -- these matrices are always small
-regardless of dtype, and float32 there produces a measurable, avoidable
-catastrophic-cancellation error. The public functions below therefore work in
+required to be float64 -- these matrices are always small regardless of
+dtype, and the distance term's expansion ``d1^2 - 2*d1*d2 + d2^2`` suffers
+measurable catastrophic cancellation in float32. The public functions below therefore work in
 float64 internally and cast to the caller's target dtype only on return.
 """
 
@@ -35,8 +34,7 @@ def kron_matvec(
     ``x`` is ``(n1, n1)``, ``y`` is ``(n2, n2)``, ``v`` has length ``n1*n2``
     and is interpreted with the row-major convention ``v[a*n2+x] = V[a, x]``.
 
-    Identity (derived and numerically verified in ``plan_spellmatch.md``):
-    ``(x kron y) @ v == vec(x @ V @ y.T)``.
+    Identity: ``(x kron y) @ v == vec(x @ V @ y.T)``.
     """
     v_mat = np.asarray(v).reshape(n1, n2)
     if sparse.issparse(x):
@@ -61,7 +59,8 @@ def outer_sum_matvec(
 ) -> np.ndarray:
     """Compute ``[A ⊙ (u 1^T + 1 u^T)] @ s`` where ``A = a1 kron a2``.
 
-    Equivalent to the original broadcast in w_csr, but in matrix-free form.
+    Equivalent to the broadcast ``A * u[:, None] + A * u[None, :]`` on the
+    explicit matrix, but in matrix-free form.
 
     ``a_s`` is ``A @ s``; pass it if the caller already has it (``w_matvec``
     always does) to skip recomputing one full ``kron_matvec`` per call.
@@ -169,7 +168,6 @@ def build_distance_correction(
     thresh: float,
     n1: int,
     n2: int,
-    chunk_size: int = 2000,
     block_nnz: int = DEFAULT_BLOCK_NNZ,
 ) -> Optional[sparse.csr_array]:
     """Build the sparse correction matrix ``relu(y-1)`` for the distance term,
@@ -189,17 +187,15 @@ def build_distance_correction(
     in the upper triangle.
 
     Memory: the exact nnz is counted first (from ``_correction_layout``'s
-    ``lo``/``hi``, without any edge-pair-scale allocation) and the CSR arrays are allocated once at their final size, with int32 indices
-    whenever they fit (``correction_index_dtype``). Rows ``v = a*n2 + x`` of
+    ``lo``/``hi``, without any edge-pair-scale allocation) and the CSR arrays
+    are allocated once at their final size, with int32 indices whenever they
+    fit (``correction_index_dtype``). Rows ``v = a*n2 + x`` of
     consecutive source cells ``a`` form a contiguous row range, so entries are
     generated in blocks of source cells (at most ``block_nnz`` entries each,
     unless a single cell has more), converted to CSR locally and copied into
     place. Peak memory is therefore the final matrix (12 B/nnz with int32)
     plus one block's temporaries -- not a global COO staging copy.
-
-    ``chunk_size`` is accepted for backwards compatibility and ignored.
     """
-    del chunk_size
     e1_a, e1_b, e1_val, e2_x, e2_y, e2_val, lo, hi = _correction_layout(d1, d2, thresh)
     thresh = np.float64(thresh)
     n = n1 * n2
@@ -315,7 +311,7 @@ def distance_term_matvec(
     materializing an edge-pair-scale dense/kron object.
 
     ``y@s`` is computed via the exact three-term Kronecker decomposition of
-    the squared difference (plan §Step 3), in float64 (required);
+    the squared difference, in float64 (required, see the module docstring);
     the clip is applied via ``y - relu(y-1)``, with
     ``relu(y-1)`` supplied pre-built as ``terms.correction``.
     """

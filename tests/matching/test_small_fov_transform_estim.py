@@ -4,9 +4,8 @@
 the k-best candidate matches via `np.argpartition(..., k_best - 1)`, which
 requires `k_best <= array length`. With the default `transform_estim_k_best
 = 50`, any FOV with fewer than 50 source points crashed outright with
-`ValueError: kth(...) out of bounds`, confirmed on a real ROI in the
-test_env dataset (33 source cells, 16 target cells) using the original,
-unmodified spellmatch. Fixed by clamping k_best to the number of available
+`ValueError: kth(...) out of bounds`, confirmed on a real ROI with 33 source
+and 16 target cells. Fixed by clamping k_best to the number of available
 candidates in both the MAX_SCORE and MAX_MARGIN branches.
 """
 

@@ -1,9 +1,8 @@
 """Numerical correctness tests for spellmatch.matching._kron_free.
 
-Ports the verification checks from plan_spellmatch.md (matchingwizard repo)
-into permanent tests: every identity the matrix-free reformulation of
-Spellmatch's distance term relies on is checked against a dense,
-brute-force ground truth, not just asserted.
+Every identity the matrix-free reformulation of Spellmatch's graph terms
+relies on is checked against a dense, brute-force ground truth, not just
+asserted.
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ def test_kron_matvec_matches_dense_kronecker_product(small_graphs):
 
 def test_kron_matvec_handles_rectangular_smaller_or_larger_second_graph():
     # n1 != n2 in both directions -- guards against an accidental square-only
-    # reshape/transpose bug (see plan_spellmatch.md's "must A be square?").
+    # reshape/transpose bug.
     rng = np.random.default_rng(1)
     for n1, n2 in [(5, 30), (30, 5)]:
         a1 = _make_symmetric_adjacency(rng, n1, 0.3)
@@ -69,8 +68,8 @@ def test_outer_sum_matvec_matches_dense_broadcast(small_graphs):
     s = rng.random(n1 * n2)
     u = rng.random(n1 * n2)
     adj = sparse.kron(a1, a2).toarray()
-    # This is exactly how the original code builds the degree/intensity
-    # contribution to w_csr: adj * u[:,None] + adj * u[None,:].
+    # The degree/intensity contribution to w_csr on the explicit matrix:
+    # adj * u[:,None] + adj * u[None,:].
     expected = (adj * (u[:, None] + u[None, :])) @ s
     actual = outer_sum_matvec(a1, a2, u, s, n1, n2)
     assert np.allclose(expected, actual)
@@ -86,7 +85,7 @@ def test_distance_term_matvec_matches_exact_clipped_ground_truth(small_graphs):
     expected = y_true @ s
 
     correction = build_distance_correction(
-        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2, chunk_size=7
+        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2
     )
     terms = DistanceTerms(d1, d2, thresh, correction)
     actual = distance_term_matvec(a1, a2, terms, s, n1, n2)
@@ -109,7 +108,7 @@ def test_correction_matrix_avoids_double_counting_and_matches_upper_triangle(
     expected_upper = np.triu(full_correction, 1)
 
     correction = build_distance_correction(
-        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2, chunk_size=7
+        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2
     )
     assert correction.nnz == int((expected_upper > 0).sum())
     dense_actual = correction.toarray()
@@ -117,10 +116,8 @@ def test_correction_matrix_avoids_double_counting_and_matches_upper_triangle(
 
 
 def test_distance_term_matvec_combined_with_degree_term(small_graphs):
-    # The hybrid must remain exact when multiple weighted terms are summed
-    # together (plan_spellmatch.md: "does degree_weight and distance_weight
-    # on together require computing the clip once or twice?" -- answer:
-    # once, and this test guards the combined-matvec arithmetic itself).
+    # The matrix-free terms must remain exact when several weighted terms are
+    # summed together; the clip is applied once, inside the distance term.
     rng, n1, n2, a1, a2, d1, d2 = small_graphs
     s = rng.random(n1 * n2)
     thresh = 3.0
@@ -140,7 +137,7 @@ def test_distance_term_matvec_combined_with_degree_term(small_graphs):
     expected = w_full @ s
 
     correction = build_distance_correction(
-        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2, chunk_size=7
+        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2
     )
     deg_term = outer_sum_matvec(a1, a2, u_deg, s, n1, n2)
     terms = DistanceTerms(d1, d2, thresh, correction)
@@ -150,8 +147,8 @@ def test_distance_term_matvec_combined_with_degree_term(small_graphs):
 
 
 def test_float32_precision_gap_and_float64_mitigation():
-    # plan_spellmatch.md §Step 4b: the d1^2+d2^2-2*d1*d2 expansion loses
-    # precision relative to (d1-d2)^2 directly; verifies the required
+    # The d1^2+d2^2-2*d1*d2 expansion loses precision relative to
+    # (d1-d2)^2 directly; verifies the required
     # float64 mitigation actually closes the gap, on a near-perfect-match
     # (worst-case cancellation) scenario.
     rng = np.random.default_rng(2)
@@ -184,13 +181,13 @@ def test_float32_precision_gap_and_float64_mitigation():
     rel_err = np.abs(actual - expected) / (np.abs(expected).max() + 1e-12)
     # float64 throughout (as required by _kron_free.distance_term_matvec)
     # should land close to machine epsilon, not the ~1e-4 float32 would give
-    # in this near-perfect-alignment / peaked scenario (see plan §Step 4b).
+    # in this near-perfect-alignment / peaked scenario.
     assert rel_err.max() < 1e-9
 
 
 def _reference_build(d1, d2, thresh, n1, n2, chunk_size=2000):
-    """The previous build_distance_correction (lists of COO chunks,
-    concatenated, then converted), kept as ground truth for the rewrite."""
+    """A straightforward reference build (lists of COO chunks, concatenated,
+    then converted), used as ground truth for build_distance_correction."""
     d1_coo = sparse.coo_array(d1)
     upper = d1_coo.row < d1_coo.col
     e1_a, e1_b = d1_coo.row[upper], d1_coo.col[upper]

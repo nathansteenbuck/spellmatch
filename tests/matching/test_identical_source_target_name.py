@@ -1,7 +1,7 @@
 """Dimension names on the final scores DataArray must be the real
 source/target identifiers, not generic placeholders -- and identical
-source/target names are an upstream-prevented scenario, not something these
-internals handle.
+source/target names are prevented earlier (in cli_match), not something
+these internals handle.
 
 icp.py, probreg.py and spellmatch.py build their final scores xr.DataArray
 as `coords={source_name: ..., target_name: ...}` (source_adj.name/
@@ -20,19 +20,16 @@ dimensions from one coordinate:
     ValueError: coordinate A3 has dimensions ('A3',), but these are not a
     subset of the DataArray dimensions ('dim_0', 'dim_1')
 
-Confirmed in a real pipeline run (matchingwizard inst/HochSchulz, 2026-09-30)
-where every single registration row names source and target identically
-(e.g. "A3,A3,A3,A3" in section_registrations.csv): 163/163 pairs failed,
-identically, across all three algorithms (cpd, icp, spellmatch).
+Observed in a real pipeline run where every source/target pair shared the
+same identifier: every pair failed this way, across all three algorithms
+(cpd, icp, spellmatch).
 
-This is now prevented one layer up instead of papered over here: spellmatch's
-own `cli_match` refuses identical source_mask/target_mask filenames before
-any matching runs (see tests/test_cli_match_validation.py), and
-matchingwizard's `validate_registration_rows` rejects it even earlier, at
-CSV-read time. These internals are intentionally left able to fail on
-identical names -- that failure should never actually be reachable in
-practice, and a regression here is exactly what should be caught if the
-upstream guards are ever removed or bypassed.
+This is prevented one layer up instead of papered over here: `cli_match`
+refuses identical source_mask/target_mask filenames before any matching
+runs (see tests/test_cli_match_validation.py). These internals are
+intentionally left able to fail on identical names -- that failure should
+never be reachable in practice, and a regression here is exactly what
+should be caught if the cli_match guard is ever removed or bypassed.
 """
 
 from __future__ import annotations
@@ -89,9 +86,8 @@ def test_spellmatch_match_graphs_uses_real_names_as_dims(synthetic_points):
 
 def test_icp_still_fails_on_identical_names_at_this_level(synthetic_points):
     # Intentionally NOT handled here -- see module docstring. If this starts
-    # passing without the upstream guards (cli_match /
-    # validate_registration_rows) also covering the case, that's a gap, not
-    # an improvement.
+    # passing without the cli_match guard also covering the case, that's a
+    # gap, not an improvement.
     source, target = synthetic_points
     algo = IterativeClosestPoints(max_dist=None)
     with pytest.raises(ValueError, match="coordinate"):

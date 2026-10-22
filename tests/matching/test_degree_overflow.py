@@ -3,8 +3,8 @@
 `Spellmatch._match_graphs` (spellmatch.py) computes per-node degree via
 `np.sum(adj, axis=1, dtype=X)`, then a full (n1, n2) outer product
 `deg1[:, None] * deg2[None, :]` -- computed in dtype X too, since numpy does
-not promote same-dtype arithmetic. With X=uint8 (the original and, until
-this fix, the fork's dtype), individual degrees never overflow at realistic
+not promote same-dtype arithmetic. With X=uint8 (the dtype used before this
+fix), individual degrees never overflow at realistic
 adj_radius values (max 20-30 seen on real IMC data), but their *product*
 routinely does: two real degree-17/16 nodes give 17*16=272, silently
 wrapping to 16 in uint8 arithmetic (mod 256), no warning, no error.
@@ -13,8 +13,8 @@ This corrupts the D^-1/2 degree normalization for the affected candidate
 pairs (an artificially small "degree" gives an artificially large
 normalization weight), breaking the assumption that guarantees the
 assembled operator's spectral radius stays <=1 -- confirmed as the root
-cause of a real NaN-divergence failure on the 2022 Melanoma dataset (see
-convergence_hypotheses.md). Fixed by widening to uint16 (65,535 max),
+cause of a real NaN-divergence failure on IMC data. Fixed by widening to
+uint16 (65,535 max),
 a >3000x margin over any degree observed in practice.
 """
 

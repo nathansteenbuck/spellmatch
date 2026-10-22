@@ -122,10 +122,9 @@ class IterativeClosestPoints(IterativePointsMatchingAlgorithm):
         # outputs (assignment CSV headers, via assignment.py's
         # scores.dims[0]/[1]) show the real file names. If source_name ==
         # target_name this dict literal would collapse to one key, silently
-        # dropping a dimension -- that's now prevented upstream (cli_match
-        # refuses identical source/target mask filenames before this is ever
-        # reached; see also matchingwizard's validate_registration_rows),
-        # not handled here.
+        # dropping a dimension -- that's prevented earlier (cli_match refuses
+        # identical source/target mask filenames before this is ever
+        # reached), not handled here.
         scores = xr.DataArray(
             data=scores_data,
             coords={
