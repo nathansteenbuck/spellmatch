@@ -13,12 +13,10 @@ import pytest
 from scipy import sparse
 
 from spellmatch.matching._kron_free import (
+    DistanceTerms,
     build_distance_correction,
     correction_matvec,
-    count_distance_correction,
     distance_term_matvec,
-    estimate_correction_bytes,
-    estimate_correction_nnz,
     kron_matvec,
     outer_sum_matvec,
 )
@@ -90,7 +88,8 @@ def test_distance_term_matvec_matches_exact_clipped_ground_truth(small_graphs):
     correction = build_distance_correction(
         sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2, chunk_size=7
     )
-    actual = distance_term_matvec(a1, a2, d1, d2, thresh, correction, s, n1, n2)
+    terms = DistanceTerms(d1, d2, thresh, correction)
+    actual = distance_term_matvec(a1, a2, terms, s, n1, n2)
     assert np.allclose(expected, actual, atol=1e-9)
 
 
@@ -144,7 +143,8 @@ def test_distance_term_matvec_combined_with_degree_term(small_graphs):
         sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2, chunk_size=7
     )
     deg_term = outer_sum_matvec(a1, a2, u_deg, s, n1, n2)
-    dist_term = distance_term_matvec(a1, a2, d1, d2, thresh, correction, s, n1, n2)
+    terms = DistanceTerms(d1, d2, thresh, correction)
+    dist_term = distance_term_matvec(a1, a2, terms, s, n1, n2)
     actual = (w_deg * deg_term + w_dist * dist_term) / (2 * w_deg + w_dist)
     assert np.allclose(expected, actual, atol=1e-9)
 
@@ -179,65 +179,13 @@ def test_float32_precision_gap_and_float64_mitigation():
     correction = build_distance_correction(
         sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2
     )
-    actual = distance_term_matvec(a1, a2, d1, d2, thresh, correction, s, n1, n2)
+    terms = DistanceTerms(d1, d2, thresh, correction)
+    actual = distance_term_matvec(a1, a2, terms, s, n1, n2)
     rel_err = np.abs(actual - expected) / (np.abs(expected).max() + 1e-12)
     # float64 throughout (as required by _kron_free.distance_term_matvec)
     # should land close to machine epsilon, not the ~1e-4 float32 would give
     # in this near-perfect-alignment / peaked scenario (see plan §Step 4b).
     assert rel_err.max() < 1e-9
-
-
-def test_estimate_correction_nnz_matches_actual_build_when_unsampled(small_graphs):
-    # small_graphs has far fewer than 2000 upper-triangle D1 edges, so the
-    # default sample_size covers every edge: the estimate should be exact,
-    # not merely close (Stage 6 pre-flight guardrail, plan_spellmatch.md).
-    _, n1, n2, _, _, d1, d2 = small_graphs
-    thresh = 5.0
-    correction = build_distance_correction(
-        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh, n1, n2
-    )
-    estimated_nnz, rel_stderr = estimate_correction_nnz(
-        sparse.csr_matrix(d1), sparse.csr_matrix(d2), thresh
-    )
-    assert estimated_nnz == correction.nnz
-    assert rel_stderr == 0.0
-
-
-def test_estimate_correction_nnz_extrapolates_under_subsampling():
-    # With more upper-triangle edges than the sample size, the estimate is a
-    # genuine extrapolation -- check it lands within a generous tolerance of
-    # the true count on a graph large enough for the law of large numbers to
-    # apply, and that it reports nonzero sampling uncertainty.
-    rng = np.random.default_rng(1)
-    n1, n2 = 120, 90
-    a1 = _make_symmetric_adjacency(rng, n1, 0.3)
-    a2 = _make_symmetric_adjacency(rng, n2, 0.3)
-    dists1 = np.triu(rng.uniform(1, 15, (n1, n1)), 1)
-    dists1 = dists1 + dists1.T
-    dists2 = np.triu(rng.uniform(1, 15, (n2, n2)), 1)
-    dists2 = dists2 + dists2.T
-    d1 = sparse.csr_matrix(a1 * dists1)
-    d2 = sparse.csr_matrix(a2 * dists2)
-    thresh = 5.0
-
-    correction = build_distance_correction(d1, d2, thresh, n1, n2)
-    estimated_nnz, rel_stderr = estimate_correction_nnz(
-        d1, d2, thresh, sample_size=200
-    )
-
-    assert rel_stderr > 0.0
-    rel_error = abs(estimated_nnz - correction.nnz) / correction.nnz
-    assert rel_error < 0.25
-
-
-def test_estimate_correction_bytes_counts_final_arrays_and_one_block():
-    assert estimate_correction_bytes(0) == 0
-    n = 1000
-    # int32: 4 B index + 8 B value per entry, int32 indptr, plus block buffer.
-    assert estimate_correction_bytes(500, n) == 500 * 12 + (n + 1) * 4 + 500 * 60
-    # Above the int32 limit everything switches to int64.
-    big = 2**31
-    assert estimate_correction_bytes(big, n, block_nnz=0) == big * 16 + (n + 1) * 8
 
 
 def _reference_build(d1, d2, thresh, n1, n2, chunk_size=2000):
@@ -297,7 +245,6 @@ def test_build_matches_reference_bit_for_bit(thresh):
     actual = build_distance_correction(d1, d2, thresh, n1, n2)
     _assert_identical(actual, _reference_build(d1, d2, thresh, n1, n2))
     assert actual.indices.dtype == actual.indptr.dtype == np.int32
-    assert count_distance_correction(d1, d2, thresh).sum() == actual.nnz
 
 
 def test_build_is_independent_of_block_size():
@@ -334,11 +281,12 @@ def test_build_is_empty_when_nothing_is_clipped(small_graphs):
     correction = build_distance_correction(
         sparse.csr_array(d1), sparse.csr_array(d2), thresh, n1, n2
     )
-    assert correction.nnz == 0
+    assert correction is None
     s = rng.random(n1 * n2)
     diff = sparse.kron(d1, a2).toarray() - sparse.kron(a1, d2).toarray()
     expected = ((diff / thresh) ** 2) @ s
-    actual = distance_term_matvec(a1, a2, d1, d2, thresh, correction, s, n1, n2)
+    terms = DistanceTerms(d1, d2, thresh, correction)
+    actual = distance_term_matvec(a1, a2, terms, s, n1, n2)
     assert np.allclose(expected, actual, atol=1e-9)
 
 

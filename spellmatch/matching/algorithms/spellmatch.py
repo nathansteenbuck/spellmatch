@@ -15,11 +15,9 @@ from sklearn.neighbors import NearestNeighbors
 
 from ..._spellmatch import hookimpl
 from .._kron_free import (
-    CorrectionMatrixTooLargeError,
+    DistanceTerms,
     build_distance_correction,
-    count_distance_correction,
     distance_term_matvec,
-    estimate_correction_bytes,
     kron_matvec,
     outer_sum_matvec,
 )
@@ -75,7 +73,6 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         intensity_all_cca_n_components: int = 10,
         distance_weight: float = 0,
         distance_cdiff_thres: float = 5,
-        max_correction_gib: Optional[float] = 32.0,
         cca_max_iter: int = 500,
         cca_tol: float = 1e-6,
         opt_max_iter: int = 200,
@@ -109,7 +106,6 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         self.intensity_all_cca_n_components = intensity_all_cca_n_components
         self.distance_weight = distance_weight
         self.distance_cdiff_thres = distance_cdiff_thres
-        self.max_correction_gib = max_correction_gib
         self.cca_max_iter = cca_max_iter
         self.cca_tol = cca_tol
         self.opt_max_iter = opt_max_iter
@@ -130,9 +126,7 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
             iteration_cache.pop("degree_cdist", None)
             iteration_cache.pop("intensity_cdist_shared", None)
             iteration_cache.pop("intensity_cdist_all", None)
-            iteration_cache.pop("distance_d1", None)
-            iteration_cache.pop("distance_d2", None)
-            iteration_cache.pop("distance_correction", None)
+            iteration_cache.pop("distance_terms", None)
             iteration_cache.pop("spatial_cdist", None)
 
     def _match_graphs_from_points(
@@ -178,21 +172,12 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         # NOTE (matrix-free fork): the original computed
         #   adj_csr = sparse.kron(adj1, adj2)
         # here -- an (n1*n2)x(n1*n2) matrix with nnz(adj1)*nnz(adj2) entries,
-        # the root cause of the OOM failures this fork addresses (see
-        # plan_spellmatch.md). adj1/adj2 are kept small and square; every use
+        # the root cause of the OOM failures this fork addresses.
+        # adj1/adj2 are kept small and square; every use
         # of "adj_csr @ v" downstream is replaced by kron_matvec(adj1, adj2,
-        # v, n1, n2), which is exact (verified) and never materializes it.
-        # dtype must have headroom for deg1[i]*deg2[j] below (numpy does not
-        # promote same-dtype arithmetic), not just for a single node's own
-        # degree -- uint8 silently wrapped this product whenever it exceeded
-        # 255 (e.g. two real degree-~17 nodes: 17*16=272 -> wrapped to 16),
-        # corrupting the D^-1/2 normalization for the affected candidate
-        # pairs and producing spurious non-convergence/NaN divergence in the
-        # opt_iteration loop. uint16 (max 65,535) gives a >3000x margin over
-        # any degree seen in practice at adj_radius~15 (geometrically, degree
-        # 256 on both sides would require ~2.8 px^2/cell, far denser than any
-        # real segmented cell) while costing far less than uint32/int64 at
-        # the (n1*n2)-scale of `deg` -- see plan_spellmatch.md.
+        # v, n1, n2), which is exact (verified) and never materializes the product graph.
+        # dtype must have headroom for deg1[i]*deg2[j] below. uint8 previously led to non-convergence.
+        # now uint16 (max 65,535) gives a >3000x margin over any degree seen in practice at adj_radius~15.
         deg1 = np.sum(adj1, axis=1, dtype=np.uint16)
         deg2 = np.sum(adj2, axis=1, dtype=np.uint16)
         deg = np.asarray(deg1[:, np.newaxis] * deg2[np.newaxis, :])
@@ -237,17 +222,16 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                     target_intensities,
                 )
                 assert c["intensity_cdist_all"].dtype == self.precision
-        if "distance_correction" not in c:
-            c["distance_d1"] = None
-            c["distance_d2"] = None
-            c["distance_correction"] = None
+        if "distance_terms" not in c:
+            # None: distance term switched off (distance_weight == 0)
+            c["distance_terms"] = None
             if self.distance_weight > 0:
                 if source_dists is None or target_dists is None:
                     raise SpellmatchException(
                         "Distances are required for computing their cross-distance"
                     )
                 logger.info("Computing distance cross-distance (matrix-free)")
-                d1, d2, correction = self._compute_distance_terms(
+                c["distance_terms"] = self._compute_distance_terms(
                     adj1,
                     adj2,
                     source_dists.to_numpy().astype(np.float64),
@@ -255,9 +239,6 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                     n1,
                     n2,
                 )
-                c["distance_d1"] = d1
-                c["distance_d2"] = d2
-                c["distance_correction"] = correction
         if "spatial_cdist" not in c:
             c["spatial_cdist"] = None
             if (
@@ -293,9 +274,7 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                 c["degree_cdist"],
                 c["intensity_cdist_shared"],
                 c["intensity_cdist_all"],
-                c["distance_d1"],
-                c["distance_d2"],
-                c["distance_correction"],
+                c["distance_terms"],
                 c["spatial_cdist"],
                 self.intensity_interp_lmd,
             )
@@ -334,9 +313,7 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                     c["degree_cdist"],
                     c["intensity_cdist_shared"],
                     c["intensity_cdist_all"],
-                    c["distance_d1"],
-                    c["distance_d2"],
-                    c["distance_correction"],
+                    c["distance_terms"],
                     c["spatial_cdist"],
                     current_lmd,
                 )
@@ -367,10 +344,6 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                     scores_data = current_scores_data
                     cancor_mean = current_cancor_mean
             logger.info(f"Best lambda={lmd:.3g} (CC mean={cancor_mean:.6f})")
-        # source_adj.name/target_adj.name used as dimension names -- see the
-        # matching comment in icp.py. Identical-name collision is now
-        # prevented upstream (cli_match / validate_registration_rows), not
-        # handled here.
         scores = xr.DataArray(
             data=scores_data,
             coords={
@@ -390,9 +363,7 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         degree_cdist: Optional[np.ndarray],
         intensity_cdist_shared: Optional[np.ndarray],
         intensity_cdist_all: Optional[np.ndarray],
-        distance_d1: Optional[sparse.spmatrix],
-        distance_d2: Optional[sparse.spmatrix],
-        distance_correction: Optional[sparse.csr_array],
+        distance_terms: Optional[DistanceTerms],
         spatial_cdist: Optional[np.ndarray],
         lmd: float,
     ) -> tuple[dict[str, Any], np.ndarray]:
@@ -417,11 +388,9 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         # and reused it as an actual matrix for every opt_iteration below.
         # Instead we build only the small ingredients each term needs, and
         # define w_matvec(v) = ~W @ v, computed fresh (cheaply) each call.
-        # This is an exact reformulation, not an approximation of w_csr@v
-        # (verified numerically -- see plan_spellmatch.md); the one place
-        # with a genuine, quantified, and mitigated precision difference is
-        # the distance term's algebra, which is why it is forced to float64
-        # below regardless of self.precision.
+        # This is an exact reformulation, not an approximation of w_csr@v.
+        # The distance term's algebra has a affected precision difference,
+        # which is why it is forced to float64 below regardless of self.precision.
         total_weight = 0.0
         if self.degree_weight > 0:
             total_weight += 2 * self.degree_weight
@@ -439,12 +408,11 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
             assert intensity_cdist is not None
             u_intensity = np.asarray(intensity_cdist.ravel(), dtype=np.float64)
         if self.distance_weight > 0:
-            assert distance_d1 is not None
-            assert distance_d2 is not None
-            assert distance_correction is not None
+            assert distance_terms is not None
 
-        adj1_f64 = np.asarray(adj1, dtype=np.float64)
-        adj2_f64 = np.asarray(adj2, dtype=np.float64)
+        # float64 is required by the distance term.
+        adj1_f64 = sparse.csr_array(adj1, dtype=np.float64)
+        adj2_f64 = sparse.csr_array(adj2, dtype=np.float64)
 
         d = np.asarray(deg.flatten(), dtype=np.float64)
         d[d != 0] = d[d != 0] ** (-0.5)
@@ -455,23 +423,15 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
             raw = np.zeros_like(a_s1)
             if self.degree_weight > 0:
                 raw += self.degree_weight * outer_sum_matvec(
-                    adj1_f64, adj2_f64, u_degree, s1, n1, n2
+                    adj1_f64, adj2_f64, u_degree, s1, n1, n2, a_s=a_s1
                 )
             if self.intensity_weight > 0:
                 raw += self.intensity_weight * outer_sum_matvec(
-                    adj1_f64, adj2_f64, u_intensity, s1, n1, n2
+                    adj1_f64, adj2_f64, u_intensity, s1, n1, n2, a_s=a_s1
                 )
             if self.distance_weight > 0:
                 raw += self.distance_weight * distance_term_matvec(
-                    adj1_f64,
-                    adj2_f64,
-                    distance_d1,
-                    distance_d2,
-                    self.distance_cdiff_thres,
-                    distance_correction,
-                    s1,
-                    n1,
-                    n2,
+                    adj1_f64, adj2_f64, distance_terms, s1, n1, n2
                 )
             if total_weight > 0:
                 raw = raw / total_weight
@@ -651,29 +611,27 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
         dists2: np.ndarray,
         n1: int,
         n2: int,
-    ) -> tuple[sparse.csr_array, sparse.csr_array, sparse.csr_array]:
+    ) -> DistanceTerms:
         """Matrix-free replacement for the original ``_compute_distance_cdist``.
 
         The original built ``clip(((kron(adj1*dists1,adj2) -
         kron(adj1,adj2*dists2))/thresh)**2, 0, 1)`` directly, an
         ``(n1*n2)x(n1*n2)`` matrix with ``nnz(adj1)*nnz(adj2)`` entries -- the
-        root cause of the OOM failures this fork fixes (plan_spellmatch.md).
+        root cause of the OOM failures this fork fixes.
 
-        Returns ``(d1, d2, correction)``: ``d1 = adj1 ⊙ dists1``, ``d2 = adj2
-        ⊙ dists2`` are small (``n1xn1``/``n2xn2``) edge-masked distance
-        matrices in float64 (required precision, see plan §Step 4b), and
-        ``correction`` is the sparse, upper-triangular-only ``relu(y-1)``
-        matrix (plan §Step 4/§5, ~20-22% fill measured on real data, exactly
-        symmetric so storing only the upper triangle loses nothing -- plan
-        §8, verified). Combined with ``distance_term_matvec``, these
-        reproduce ``clip(y,0,1) @ s`` exactly, without ever materializing the
-        big object.
+        Returns ``DistanceTerms(d1, d2, thresh, correction)``: ``d1 = adj1 ⊙
+        dists1``, ``d2 = adj2 ⊙ dists2`` are small (``n1xn1``/``n2xn2``)
+        edge-masked distance matrices in float64, and ``correction`` is the
+        sparse, upper-triangular-only ``relu(y-1)`` matrix (symmetric), or
+        ``None`` if no edge pair is clipped. Combined with
+        ``distance_term_matvec``, these reproduce ``clip(y,0,1) @ s`` exactly,
+        without ever materializing the big object.
         """
         d1 = sparse.csr_array((adj1 * dists1).astype(np.float64))
         d2 = sparse.csr_array((adj2 * dists2).astype(np.float64))
 
         # |d1 - d2| <= max edge length, so if no edge is longer than the
-        # threshold the clip can never fire and the correction is empty.
+        # threshold the clip can never fire and no correction is needed.
         max_edge = max(
             d1.max() if d1.nnz > 0 else 0.0, d2.max() if d2.nnz > 0 else 0.0
         )
@@ -684,39 +642,22 @@ class Spellmatch(IterativeGraphMatchingAlgorithm):
                 max_edge,
                 self.distance_cdiff_thres,
             )
-            return d1, d2, sparse.csr_array((n1 * n2, n1 * n2), dtype=np.float64)
-
-        if self.max_correction_gib is not None:
-            budget_bytes = self.max_correction_gib * (1024**3)
-            nnz = int(
-                count_distance_correction(d1, d2, self.distance_cdiff_thres).sum()
-            )
-            estimated_bytes = estimate_correction_bytes(nnz, n1 * n2)
-            if estimated_bytes > budget_bytes:
-                raise CorrectionMatrixTooLargeError(
-                    "Distance-correction matrix "
-                    f"({nnz:,} nonzeros, ~{estimated_bytes / 1024**3:.1f} GiB to "
-                    f"build) exceeds the configured budget of "
-                    f"{self.max_correction_gib:.1f} GiB (max_correction_gib). "
-                    "This FOV pair is too dense/large for the current distance-term "
-                    "settings. Options: raise max_correction_gib if this host actually "
-                    "has the memory, set distance_cdiff_thres >= adj_radius (no "
-                    "correction needed), or fall back to spatial tiling "
-                    "(plan_spellmatch.md, Stage 6 fallback options)."
-                )
-            logger.info(
-                "Distance-correction pre-flight: %s nonzeros (exact), ~%.2f GiB "
-                "peak for building the correction matrix alone (not the whole "
-                "process), within %.1f GiB budget",
-                f"{nnz:,}",
-                estimated_bytes / 1024**3,
-                self.max_correction_gib,
-            )
+            return DistanceTerms(d1, d2, self.distance_cdiff_thres, correction=None)
 
         correction = build_distance_correction(
             d1, d2, self.distance_cdiff_thres, n1, n2
         )
-        return d1, d2, correction
+        if correction is None:
+            logger.info(
+                "Distance-correction skipped: no edge pair differs by more than "
+                "distance_cdiff_thres (%s), nothing is clipped",
+                self.distance_cdiff_thres,
+            )
+        else:
+            logger.info(
+                "Built distance-correction matrix: %s nonzeros", f"{correction.nnz:,}"
+            )
+        return DistanceTerms(d1, d2, self.distance_cdiff_thres, correction)
 
 
 class SpellmatchException(SpellmatchMatchingAlgorithmException):

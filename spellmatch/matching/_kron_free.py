@@ -18,6 +18,8 @@ float64 internally and cast to the caller's target dtype only on return.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from scipy import sparse
@@ -49,27 +51,30 @@ def kron_matvec(
 
 
 def outer_sum_matvec(
-    a1: np.ndarray, a2: np.ndarray, u: np.ndarray, s: np.ndarray, n1: int, n2: int
+    a1: np.ndarray,
+    a2: np.ndarray,
+    u: np.ndarray,
+    s: np.ndarray,
+    n1: int,
+    n2: int,
+    a_s: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compute ``[A ⊙ (u 1^T + 1 u^T)] @ s`` where ``A = a1 kron a2``.
 
-    This is exactly how the *original* implementation already builds the
-    degree/intensity contributions to ``w_csr`` (two broadcast ``+=``
-    statements) -- this function is a matrix-free restatement of that
-    existing broadcast, not new algebra. Requires ``u`` to index the same
-    candidate space as both the rows and columns of ``A`` (only meaningful
-    because ``A`` is square: see plan_spellmatch.md's answer to "does this
-    require A to be square").
+    Equivalent to the original broadcast in w_csr, but in matrix-free form.
+
+    ``a_s`` is ``A @ s``; pass it if the caller already has it (``w_matvec``
+    always does) to skip recomputing one full ``kron_matvec`` per call.
     """
-    a_s = kron_matvec(a1, a2, s, n1, n2)
+    if a_s is None:
+        a_s = kron_matvec(a1, a2, s, n1, n2)
     return u * a_s + kron_matvec(a1, a2, u * s, n1, n2)
 
 
 # Default number of correction entries generated per block in
-# build_distance_correction. Block temporaries cost roughly
-# _BLOCK_BYTES_PER_NNZ bytes per entry (measured ~45), so 1e7 keeps them below 1 GB.
+# build_distance_correction. Block temporaries cost roughly 45-60 bytes per
+# entry (measured), so 1e7 keeps them below 1 GB.
 DEFAULT_BLOCK_NNZ = 10_000_000
-_BLOCK_BYTES_PER_NNZ = 60
 _INT32_LIMIT = 2**31
 
 
@@ -88,7 +93,7 @@ def _clipped(d1_val: np.ndarray, d2_val: np.ndarray, thresh: np.float64) -> np.n
 
 
 def _correction_layout(d1: sparse.spmatrix, d2: sparse.spmatrix, thresh: float):
-    """Shared setup for counting and building the correction matrix.
+    """Setup for building the correction matrix.
 
     Returns the upper-triangle D1 edges sorted by source cell ``a``, the D2
     edges sorted by length, and per D1 edge the bounds ``lo``/``hi`` such that
@@ -158,19 +163,6 @@ def _correction_layout(d1: sparse.spmatrix, d2: sparse.spmatrix, thresh: float):
     return e1_a, e1_b, e1_val, e2_x, e2_y, e2_val, lo, hi
 
 
-def count_distance_correction(
-    d1: sparse.spmatrix, d2: sparse.spmatrix, thresh: float
-) -> np.ndarray:
-    """Exact number of correction entries contributed by each upper-triangle
-    D1 edge (in source-cell order); ``.sum()`` is the correction's nnz.
-
-    Costs O(E1 log E2) and allocates nothing of edge-pair size, so it is used
-    as the pre-flight check before any large allocation.
-    """
-    *_, e2_val, lo, hi = _correction_layout(d1, d2, thresh)
-    return lo + (len(e2_val) - hi)
-
-
 def build_distance_correction(
     d1: sparse.spmatrix,
     d2: sparse.spmatrix,
@@ -179,13 +171,14 @@ def build_distance_correction(
     n2: int,
     chunk_size: int = 2000,
     block_nnz: int = DEFAULT_BLOCK_NNZ,
-) -> sparse.csr_array:
-    """Build the sparse correction matrix ``relu(y-1)`` for the distance term.
+) -> Optional[sparse.csr_array]:
+    """Build the sparse correction matrix ``relu(y-1)`` for the distance term,
+    or return ``None`` if no edge pair is clipped (no correction needed).
 
     ``d1 = A1 ⊙ dists1``, ``d2 = A2 ⊙ dists2`` (edge-masked distances, i.e.
     zero everywhere the corresponding adjacency is zero). Only entries where
     the clip actually fires (``y = ((d1[a,b]-d2[x,y])/thresh)**2 > 1``) are
-    stored, and only the upper triangle (``v < w``) -- see plan §Step 4/§8:
+    stored, and only the upper triangle (``v < w``):
     the whole formulation is exactly symmetric with a structurally zero
     diagonal, so this loses no information and the matvec later reconstructs
     the full effect via ``U@s + U.T@s``.
@@ -195,8 +188,8 @@ def build_distance_correction(
     Since ``a < b``, ``v = a*n2 + x < b*n2 <= w``, so every entry already lies
     in the upper triangle.
 
-    Memory: the exact nnz is counted first (``count_distance_correction``) and
-    the CSR arrays are allocated once at their final size, with int32 indices
+    Memory: the exact nnz is counted first (from ``_correction_layout``'s
+    ``lo``/``hi``, without any edge-pair-scale allocation) and the CSR arrays are allocated once at their final size, with int32 indices
     whenever they fit (``correction_index_dtype``). Rows ``v = a*n2 + x`` of
     consecutive source cells ``a`` form a contiguous row range, so entries are
     generated in blocks of source cells (at most ``block_nnz`` entries each,
@@ -212,6 +205,8 @@ def build_distance_correction(
     n = n1 * n2
     counts = lo + (len(e2_val) - hi)
     nnz = int(counts.sum())
+    if nnz == 0:
+        return None
 
     idx_dtype = correction_index_dtype(n, nnz)
     if idx_dtype is np.int64:
@@ -221,8 +216,6 @@ def build_distance_correction(
             f"{n:,}",
             f"{nnz:,}",
         )
-    if nnz == 0:
-        return sparse.csr_array((n, n), dtype=np.float64)
 
     indptr = np.empty(n + 1, dtype=idx_dtype)
     indices = np.empty(nnz, dtype=idx_dtype)
@@ -284,105 +277,36 @@ def build_distance_correction(
     return sparse.csr_array((data, indices, indptr), shape=(n, n))
 
 
-class CorrectionMatrixTooLargeError(MemoryError):
-    """Raised when the estimated distance-correction matrix would exceed the
-    configured memory budget, instead of silently attempting an allocation
-    that could OOM the process (plan_spellmatch.md, Stage 6)."""
-
-
-def estimate_correction_nnz(
-    d1: sparse.spmatrix,
-    d2: sparse.spmatrix,
-    thresh: float,
-    sample_size: int = 2000,
-    seed: int = 0,
-) -> tuple[int, float]:
-    """Estimate ``build_distance_correction``'s output size by running its
-    exact per-edge comparison on a random sample of D1's upper-triangle
-    edges (instead of all of them) against the full D2 edge list, then
-    extrapolating linearly -- the "hits per D1 edge" this measures does not
-    depend on which edges are sampled, only on the (fixed, already-known) D2
-    edge population, so a small sample is representative.
-
-    Returns ``(estimated_nnz, relative_stderr)``: the point estimate and the
-    sampling distribution's relative standard error, so callers can apply a
-    safety margin instead of trusting a single number exactly at a budget
-    boundary.
-    """
-    d1_coo = sparse.coo_array(d1)
-    upper = d1_coo.row < d1_coo.col
-    e1_val = d1_coo.data[upper].astype(np.float64)
-    n_e1 = len(e1_val)
-    if n_e1 == 0:
-        return 0, 0.0
-
-    d2_coo = sparse.coo_array(d2)
-    e2_val = d2_coo.data.astype(np.float64)
-    if len(e2_val) == 0:
-        return 0, 0.0
-
-    rng = np.random.default_rng(seed)
-    exhaustive = sample_size >= n_e1
-    sample_size = min(sample_size, n_e1)
-    sample = e1_val[rng.choice(n_e1, size=sample_size, replace=False)]
-
-    thresh = np.float64(thresh)
-    diff = sample[:, np.newaxis] - e2_val[np.newaxis, :]
-    y = (diff / thresh) ** 2
-    hits_per_edge = (y > 1.0).sum(axis=1).astype(np.float64)
-
-    mean_hits = hits_per_edge.mean()
-    estimated_nnz = int(round(mean_hits * n_e1))
-
-    if exhaustive:
-        # The whole population was measured, not sampled -- the count is
-        # exact, with no extrapolation uncertainty to report.
-        rel_stderr = 0.0
-    elif mean_hits > 0 and sample_size > 1:
-        std_hits = hits_per_edge.std(ddof=1)
-        rel_stderr = float((std_hits / np.sqrt(sample_size)) / mean_hits)
-    else:
-        rel_stderr = 0.0
-    return estimated_nnz, rel_stderr
-
-
-def estimate_correction_bytes(
-    nnz: int, n: int = 0, block_nnz: int = DEFAULT_BLOCK_NNZ
-) -> int:
-    """Peak-memory estimate (bytes) for ``build_distance_correction``.
-
-    The CSR arrays are allocated once at their final size: ``indices`` and
-    ``indptr`` (4 bytes each with int32, 8 with int64, see
-    ``correction_index_dtype``) plus float64 ``data``. On top of that, one
-    block of at most ``block_nnz`` entries is alive while it is generated, at
-    roughly ``_BLOCK_BYTES_PER_NNZ`` bytes per entry. ``n = n1*n2`` is the
-    number of rows (sizes ``indptr``).
-    """
-    nnz = int(nnz)
-    if nnz == 0:
-        return 0
-    index_bytes = np.dtype(correction_index_dtype(n, nnz)).itemsize
-    final = nnz * (index_bytes + 8) + (n + 1) * index_bytes
-    return final + min(nnz, block_nnz) * _BLOCK_BYTES_PER_NNZ
-
-
 def correction_matvec(correction: sparse.csr_array, s: np.ndarray) -> np.ndarray:
     """Apply an upper-triangular-only symmetric correction matrix to ``s``.
 
     ``correction`` stores only ``v < w``; the true (symmetric, zero-diagonal)
-    matrix's action is ``U@s + U.T@s`` (plan §8 -- pure memory win, roughly
-    the same total FLOPs as one matvec on the full matrix).
+    matrix's action is ``U@s + U.T@s``.
     """
     return correction @ s + correction.T @ s
+
+
+@dataclass(frozen=True)
+class DistanceTerms:
+    """Precomputed ingredients of the distance term, built once per FOV pair.
+
+    ``d1 = adj1 ⊙ dists1`` and ``d2 = adj2 ⊙ dists2`` are the edge-masked
+    distance matrices (float64), ``thresh`` is the ``distance_cdiff_thres``
+    the correction was built with, and ``correction`` is the upper-triangular
+    ``relu(y-1)`` matrix from ``build_distance_correction`` -- or ``None`` if
+    no edge pair is clipped, in which case no correction is applied.
+    """
+
+    d1: sparse.csr_array
+    d2: sparse.csr_array
+    thresh: float
+    correction: Optional[sparse.csr_array]
 
 
 def distance_term_matvec(
     a1: np.ndarray,
     a2: np.ndarray,
-    d1: sparse.spmatrix,
-    d2: sparse.spmatrix,
-    thresh: float,
-    correction: sparse.csr_array,
+    terms: DistanceTerms,
     s: np.ndarray,
     n1: int,
     n2: int,
@@ -391,10 +315,11 @@ def distance_term_matvec(
     materializing an edge-pair-scale dense/kron object.
 
     ``y@s`` is computed via the exact three-term Kronecker decomposition of
-    the squared difference (plan §Step 3), in float64 (required -- plan
-    §Step 4b); the clip is applied via ``y - relu(y-1)`` (plan §Step 4), with
-    ``relu(y-1)`` supplied pre-built as ``correction``.
+    the squared difference (plan §Step 3), in float64 (required);
+    the clip is applied via ``y - relu(y-1)``, with
+    ``relu(y-1)`` supplied pre-built as ``terms.correction``.
     """
+    d1, d2, thresh = terms.d1, terms.d2, terms.thresh
     d1_f64 = d1.astype(np.float64) if sparse.issparse(d1) else np.asarray(d1, dtype=np.float64)
     d2_f64 = d2.astype(np.float64) if sparse.issparse(d2) else np.asarray(d2, dtype=np.float64)
     a1_f64 = a1.astype(np.float64) if sparse.issparse(a1) else np.asarray(a1, dtype=np.float64)
@@ -411,8 +336,8 @@ def distance_term_matvec(
         + kron_matvec(a1_f64, d2_sq, s_f64, n1, n2)
     ) / thresh2
 
-    if correction.nnz == 0:
+    if terms.correction is None:
         # Nothing clipped (e.g. distance_cdiff_thres >= longest edge).
         return algebraic
-    corr = correction_matvec(correction, s_f64)
+    corr = correction_matvec(terms.correction, s_f64)
     return algebraic - corr
